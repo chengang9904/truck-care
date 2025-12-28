@@ -49,12 +49,12 @@ class TireVisualizer(tk.Canvas):
         vehicle_label: str,
         on_select: Callable[[str], None],
     ) -> None:
-        if len(tire_positions) == 8:
-            height = 400
+        if len(tire_positions) == 4:
+            height = 300
         else:
-            height = 550
+            height = 350
         
-        super().__init__(parent, width=250, height=height, bg="#f0f0f0", highlightthickness=0)
+        super().__init__(parent, width=200, height=height, bg="#f0f0f0", highlightthickness=0)
         self.tire_positions = tire_positions
         self.vehicle_label = vehicle_label
         self.on_select = on_select
@@ -65,145 +65,59 @@ class TireVisualizer(tk.Canvas):
         self._draw_vehicle()
 
     def _draw_vehicle(self) -> None:
-        cx = 125
-        w, h = 28, 48  # 牵引车轮胎更大更长
-        offset_x = 60
-        tire_gap = 6  # 两轮之间的间距
+        cx = 100
+        w, h = 25, 40
+        offset_x = 45
 
-        if len(self.tire_positions) == 8:  # 牵引车（8轮，2轴，每轴左右各2个）
-            # 驾驶室（前部带圆角的立体造型）
-            cab_top = 50
-            cab_bottom = 160
-            cab_left = cx - 40
-            cab_right = cx + 40
-            
-            # 驾驶室主体（渐变色模拟）
-            self.create_rectangle(cab_left, cab_top + 10, cab_right, cab_bottom, 
-                                fill="#2e5c8a", outline="#1a3a5c", width=2)
-            # 驾驶室顶部（挡风玻璃）
+        if len(self.tire_positions) == 4:  # 牵引车
+            self.create_rectangle(cx - 30, 50, cx + 30, 270, fill="#d0d0d0", outline="#999")
             self.create_polygon(
-                cab_left, cab_top + 10, 
-                cab_right, cab_top + 10, 
-                cab_right - 5, cab_top - 15, 
-                cab_left + 5, cab_top - 15,
-                fill="#6ba3d8", outline="#3d7fb8", width=2
+                cx - 40, 50, cx + 40, 50, cx + 35, 15, cx - 35, 15,
+                fill="#a0c0e0", outline="#6080a0", width=2
             )
-            # 前保险杠
-            self.create_rectangle(cab_left + 5, cab_bottom, cab_right - 5, cab_bottom + 8,
-                                fill="#1a1a1a", outline="#000", width=1)
-            
-            # 车窗
-            self.create_rectangle(cab_left + 8, cab_top + 20, cab_right - 8, cab_top + 55,
-                                fill="#87ceeb", outline="#4682b4", width=2)
-            
-            # 货箱/引擎盖部分
-            engine_top = cab_bottom + 15
-            engine_bottom = 360
-            self.create_rectangle(cx - 38, engine_top, cx + 38, engine_bottom,
-                                fill="#d5d5d5", outline="#888", width=2)
-            
-            # 货箱细节线条
-            for detail_y in [engine_top + 40, engine_top + 80]:
-                self.create_line(cx - 38, detail_y, cx + 38, detail_y, 
-                               fill="#aaa", width=1)
-            
-            # 标签
-            self.create_text(cx, cab_top + 40, text=self.vehicle_label, 
-                           fill="white", font=("Segoe UI", 9, "bold"))
+            self.create_text(cx, 32, text=self.vehicle_label, fill="#333", font=("Segoe UI", 9, "bold"))
 
-            # 轮胎位置（2轴：前轮1轴 + 后轮1轴），两轮之间有间距
-            y_positions = [cab_bottom + 30, engine_bottom - 55]
+            y_positions = [90, 150, 210]
             layout = [
-                (self.tire_positions[0], cx - offset_x - w, y_positions[0]),
-                (self.tire_positions[1], cx - offset_x - w + w + tire_gap, y_positions[0]),
-                (self.tire_positions[2], cx + offset_x - w - tire_gap, y_positions[0]),
-                (self.tire_positions[3], cx + offset_x, y_positions[0]),
-                (self.tire_positions[4], cx - offset_x - w, y_positions[1]),
-                (self.tire_positions[5], cx - offset_x - w + w + tire_gap, y_positions[1]),
-                (self.tire_positions[6], cx + offset_x - w - tire_gap, y_positions[1]),
-                (self.tire_positions[7], cx + offset_x, y_positions[1]),
+                (self.tire_positions[0], cx - offset_x - w / 2, y_positions[0]),
+                (self.tire_positions[1], cx + offset_x - w / 2, y_positions[0]),
+                (self.tire_positions[2], cx - offset_x - w / 2, y_positions[1]),
+                (self.tire_positions[3], cx + offset_x - w / 2, y_positions[1]),
+            ]
+            axle_ys = [y_positions[0], y_positions[1]]
+
+        else:  # 挂车
+            self.create_rectangle(cx - 30, 30, cx + 30, 320, fill="#c8c8c8", outline="#888")
+            self.create_text(cx, 50, text=self.vehicle_label, fill="#333", font=("Segoe UI", 9, "bold"))
+
+            y_positions = [100, 170, 240]
+            layout = [
+                (self.tire_positions[0], cx - offset_x - w / 2, y_positions[0]),
+                (self.tire_positions[1], cx + offset_x - w / 2, y_positions[0]),
+                (self.tire_positions[2], cx - offset_x - w / 2, y_positions[1]),
+                (self.tire_positions[3], cx + offset_x - w / 2, y_positions[1]),
+                (self.tire_positions[4], cx - offset_x - w / 2, y_positions[2]),
+                (self.tire_positions[5], cx + offset_x - w / 2, y_positions[2]),
             ]
             axle_ys = y_positions
 
-        else:  # 挂车（12轮，6轴）简洁设计
-            # 挂车就是一个简单的矩形
-            trailer_top = 50
-            trailer_bottom = 500
-            trailer_width = 45
-            
-            cargo_left = cx - trailer_width
-            cargo_right = cx + trailer_width
-            
-            # 货箱矩形（简单的灰色矩形）
-            self.create_rectangle(cargo_left, trailer_top, cargo_right, trailer_bottom,
-                                fill="#d5d5d5", outline="#666", width=2)
-            
-            # 标签
-            self.create_text(cx, trailer_top + 25, text=self.vehicle_label,
-                           fill="#333", font=("Segoe UI", 10, "bold"))
-            
-            # 轮胎参数
-            w_trailer, h_trailer = 26, 44
-            tire_gap_trailer = 5
-            offset_x_trailer = 58
-            
-            # 3轴轮胎均匀分布在矩形中间区域，前后留空隙
-            total_height = trailer_bottom - trailer_top
-            margin_top = 120  # 前部空隙
-            margin_bottom = 120  # 后部空隙
-            wheel_zone_height = total_height - margin_top - margin_bottom
-            
-            # 3轴均匀分布
-            axle_spacing = wheel_zone_height / 2  # 2个间隔分配3轴
-            
-            y_positions = [
-                int(trailer_top + margin_top + axle_spacing * 0),
-                int(trailer_top + margin_top + axle_spacing * 1),
-                int(trailer_top + margin_top + axle_spacing * 2),
-            ]
-            
-            layout = [
-                (self.tire_positions[0], cx - offset_x_trailer - w_trailer, y_positions[0]),
-                (self.tire_positions[1], cx - offset_x_trailer - w_trailer + w_trailer + tire_gap_trailer, y_positions[0]),
-                (self.tire_positions[2], cx + offset_x_trailer - w_trailer - tire_gap_trailer, y_positions[0]),
-                (self.tire_positions[3], cx + offset_x_trailer, y_positions[0]),
-                (self.tire_positions[4], cx - offset_x_trailer - w_trailer, y_positions[1]),
-                (self.tire_positions[5], cx - offset_x_trailer - w_trailer + w_trailer + tire_gap_trailer, y_positions[1]),
-                (self.tire_positions[6], cx + offset_x_trailer - w_trailer - tire_gap_trailer, y_positions[1]),
-                (self.tire_positions[7], cx + offset_x_trailer, y_positions[1]),
-                (self.tire_positions[8], cx - offset_x_trailer - w_trailer, y_positions[2]),
-                (self.tire_positions[9], cx - offset_x_trailer - w_trailer + w_trailer + tire_gap_trailer, y_positions[2]),
-                (self.tire_positions[10], cx + offset_x_trailer - w_trailer - tire_gap_trailer, y_positions[2]),
-                (self.tire_positions[11], cx + offset_x_trailer, y_positions[2]),
-            ]
-            axle_ys = y_positions
-            w, h = w_trailer, h_trailer  # 使用挂车轮胎尺寸进行后续绘制
-
-        # 绘制车轴（更粗更明显）
         for y in axle_ys:
-            self.create_line(cx - 65, y + h / 2, cx + 65, y + h / 2, 
-                           width=4, fill="#2c3e50")
+            self.create_line(cx - 50, y + h / 2, cx + 50, y + h / 2, width=3, fill="#555")
 
-        # 绘制轮胎（带立体效果）
         for pos, x, y in layout:
-            # 轮胎阴影
-            self.create_rectangle(
-                x + 2, y + 2, x + w + 2, y + h + 2,
-                fill="#222", outline="", width=0
-            )
-            # 轮胎主体
             tag = self.create_rectangle(
                 x, y, x + w, y + h,
-                fill="#1a1a1a", outline="#000", width=2,
+                fill="#444", outline="#000", width=1,
                 tags=("tire", f"tire:{pos}")
             )
             self._item_map[pos] = tag
-            
-            # 轮胎纹路（2条横线模拟花纹）
-            self.create_line(x + 4, y + h/3, x + w - 4, y + h/3, 
-                           fill="#333", width=1)
-            self.create_line(x + 4, y + 2*h/3, x + w - 4, y + 2*h/3, 
-                           fill="#333", width=1)
+
+            label_x = x - 15 if x < cx else x + w + 15
+            t_tag = self.create_text(
+                label_x, y + h / 2,
+                text=pos, font=("Segoe UI", 8, "bold"), fill="#333"
+            )
+            self._text_map[pos] = t_tag
 
             self.tag_bind(tag, "<Button-1>", lambda e, p=pos: self.on_select(p))
             self.tag_bind(tag, "<Enter>", lambda e, p=pos: self._on_hover(p, True))
@@ -213,16 +127,16 @@ class TireVisualizer(tk.Canvas):
         if pos == self.selected_pos:
             return
         tag = self._item_map[pos]
-        self.itemconfigure(tag, fill="#404040" if enter else "#1a1a1a")
+        self.itemconfigure(tag, fill="#666" if enter else "#444")
 
     def select(self, pos: str | None) -> None:
         if self.selected_pos and self.selected_pos in self._item_map:
-            self.itemconfigure(self._item_map[self.selected_pos], fill="#1a1a1a", outline="#000", width=2)
+            self.itemconfigure(self._item_map[self.selected_pos], fill="#444", outline="#000", width=1)
 
         self.selected_pos = pos
         if pos and pos in self._item_map:
             tag = self._item_map[pos]
-            self.itemconfigure(tag, fill="#e74c3c", outline="#c0392b", width=3)
+            self.itemconfigure(tag, fill="#3b8ed0", outline="#1d4f7c", width=2)
 
 
 class EntryDialog(tk.Toplevel):
@@ -277,27 +191,6 @@ class EntryDialog(tk.Toplevel):
 
         self.grab_set()
         self.wait_visibility()
-        
-        # 居中显示对话框
-        self.update_idletasks()
-        width = self.winfo_width()
-        height = self.winfo_height()
-        
-        # 获取父窗口位置和大小
-        parent_x = parent.winfo_rootx()
-        parent_y = parent.winfo_rooty()
-        parent_width = parent.winfo_width()
-        parent_height = parent.winfo_height()
-        
-        # 计算居中位置
-        x = parent_x + (parent_width - width) // 2
-        y = parent_y + (parent_height - height) // 2
-        
-        # 确保对话框在屏幕内
-        x = max(0, x)
-        y = max(0, y)
-        
-        self.geometry(f"+{x}+{y}")
         self.focus_set()
 
     def _submit(self) -> None:
@@ -363,7 +256,7 @@ class TractorManagementFrame(ttk.Frame):
 
         # 轮胎页
         tire_tab = self._create_tire_tab(notebook)
-        notebook.add(tire_tab, text="轮胎（8轮）")
+        notebook.add(tire_tab, text="轮胎（4轮）")
 
         # 保养页
         maint_tab = self._create_maintenance_tab(notebook)
@@ -732,7 +625,7 @@ class TrailerManagementFrame(ttk.Frame):
         notebook.pack(fill="both", expand=True, padx=5, pady=5)
 
         tire_tab = self._create_tire_tab(notebook)
-        notebook.add(tire_tab, text="轮胎（12轮）")
+        notebook.add(tire_tab, text="轮胎（6轮）")
 
         maint_tab = self._create_maintenance_tab(notebook)
         notebook.add(maint_tab, text="保养记录")

@@ -1,0 +1,1054 @@
+from __future__ import annotations
+
+import tkinter as tk
+from datetime import date
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from typing import Callable
+
+from .constants import (
+    MAINTENANCE_TYPES,
+    TRACTOR_TIRE_POSITIONS,
+    TRAILER_TIRE_POSITIONS,
+    VEHICLE_TYPE_TRACTOR,
+    VEHICLE_TYPE_TRAILER,
+)
+from .db import Database, MaintenanceRecord, TireEvent, Tractor, Trailer
+from .exporter import export_csv
+
+
+def _parse_int(value: str, field_name: str) -> int:
+    value = value.strip()
+    if not value:
+        raise ValueError(f"{field_name}不能为空")
+    try:
+        n = int(value)
+    except ValueError as e:
+        raise ValueError(f"{field_name}必须是整数") from e
+    if n < 0:
+        raise ValueError(f"{field_name}不能为负数")
+    return n
+
+
+def _parse_date(value: str, field_name: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError(f"{field_name}不能为空")
+    date.fromisoformat(value)
+    return value
+
+
+class TireVisualizer(tk.Canvas):
+    """轮胎可视化组件"""
+    
+    def __init__(
+        self,
+        parent: tk.Widget,
+        tire_positions: tuple[str, ...],
+        vehicle_label: str,
+        on_select: Callable[[str], None],
+    ) -> None:
+        # 根据轮胎数量调整高度
+        if len(tire_positions) == 4:  # 牵引车
+            height = 300
+        else:  # 挂车
+            height = 350
+        
+        super().__init__(parent, width=200, height=height, bg="#f0f0f0", highlightthickness=0)
+        self.tire_positions = tire_positions
+        self.vehicle_label = vehicle_label
+        self.on_select = on_select
+        self.selected_pos: str | None = None
+        self._item_map: dict[str, int] = {}
+        self._text_map: dict[str, int] = {}
+
+        self._draw_vehicle()
+
+    def _draw_vehicle(self) -> None:
+        cx = 100  # Center X
+        w, h = 25, 40  # Wheel dimensions
+        offset_x = 45  # Distance from center to wheel center
+
+        if len(self.tire_positions) == 4:  # 牵引车
+            # Chassis
+            self.create_rectangle(cx - 30, 50, cx + 30, 270, fill="#d0d0d0", outline="#999")
+            # Cab
+            self.create_polygon(
+                cx - 40, 50, cx + 40, 50, cx + 35, 15, cx - 35, 15,
+                fill="#a0c0e0", outline="#6080a0", width=2
+            )
+            self.create_text(cx, 32, text=self.vehicle_label, fill="#333", font=("Segoe UI", 9, "bold"))
+
+            y_positions = [90, 150, 210]  # F1/F2在第一排，F3/F4在第二排，底部留空
+            layout = [
+                (self.tire_positions[0], cx - offset_x - w / 2, y_positions[0]),
+                (self.tire_positions[1], cx + offset_x - w / 2, y_positions[0]),
+                (self.tire_positions[2], cx - offset_x - w / 2, y_positions[1]),
+                (self.tire_positions[3], cx + offset_x - w / 2, y_positions[1]),
+            ]
+            axle_ys = [y_positions[0], y_positions[1]]
+
+        else:  # 挂车 6 轮
+            # Chassis (trailer body)
+            self.create_rectangle(cx - 30, 30, cx + 30, 320, fill="#c8c8c8", outline="#888")
+            self.create_text(cx, 50, text=self.vehicle_label, fill="#333", font=("Segoe UI", 9, "bold"))
+
+            y_positions = [100, 170, 240]
+            layout = [
+                (self.tire_positions[0], cx - offset_x - w / 2, y_positions[0]),
+                (self.tire_positions[1], cx + offset_x - w / 2, y_positions[0]),
+                (self.tire_positions[2], cx - offset_x - w / 2, y_positions[1]),
+                (self.tire_positions[3], cx + offset_x - w / 2, y_positions[1]),
+                (self.tire_positions[4], cx - offset_x - w / 2, y_positions[2]),
+                (self.tire_positions[5], cx + offset_x - w / 2, y_positions[2]),
+            ]
+            axle_ys = y_positions
+
+        # Draw axles
+        for y in axle_ys:
+            self.create_line(cx - 50, y + h / 2, cx + 50, y + h / 2, width=3, fill="#555")
+
+        # Draw wheels
+        for pos, x, y in layout:
+            tag = self.create_rectangle(
+                x, y, x + w, y + h,
+                fill="#444", outline="#000", width=1,
+                tags=("tire", f"tire:{pos}")
+            )
+            self._item_map[pos] = tag
+
+            label_x = x - 15 if x < cx else x + w + 15
+            t_tag = self.create_text(
+                label_x, y + h / 2,
+                text=pos, font=("Segoe UI", 8, "bold"), fill="#333"
+            )
+            self._text_map[pos] = t_tag
+
+            self.tag_bind(tag, "<Button-1>", lambda e, p=pos: self.on_select(p))
+            self.tag_bind(tag, "<Enter>", lambda e, p=pos: self._on_hover(p, True))
+            self.tag_bind(tag, "<Leave>", lambda e, p=pos: self._on_hover(p, False))
+
+    def _on_hover(self, pos: str, enter: bool) -> None:
+        if pos == self.selected_pos:
+            return
+        tag = self._item_map[pos]
+        self.itemconfigure(tag, fill="#666" if enter else "#444")
+
+    def select(self, pos: str | None) -> None:
+        if self.selected_pos and self.selected_pos in self._item_map:
+            self.itemconfigure(self._item_map[self.selected_pos], fill="#444", outline="#000", width=1)
+
+        self.selected_pos = pos
+        if pos and pos in self._item_map:
+            tag = self._item_map[pos]
+            self.itemconfigure(tag, fill="#3b8ed0", outline="#1d4f7c", width=2)
+
+
+class EntryDialog(tk.Toplevel):
+    """通用输入对话框"""
+    
+    def __init__(
+        self,
+        parent: tk.Widget,
+        title: str,
+        fields: list[tuple[str, str]],
+        initial: dict[str, str] | None = None,
+        option_fields: dict[str, tuple[str, ...]] | None = None,
+        on_submit: Callable[[dict[str, str]], None] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.transient(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self._on_submit = on_submit
+
+        initial = initial or {}
+        option_fields = option_fields or {}
+
+        body = ttk.Frame(self, padding=12)
+        body.grid(row=0, column=0, sticky="nsew")
+
+        self._vars: dict[str, tk.StringVar] = {}
+
+        for i, (key, label) in enumerate(fields):
+            ttk.Label(body, text=label).grid(row=i, column=0, sticky="w", padx=(0, 10), pady=4)
+            var = tk.StringVar(value=initial.get(key, ""))
+            self._vars[key] = var
+
+            if key in option_fields:
+                combo = ttk.Combobox(body, textvariable=var, values=list(option_fields[key]), state="readonly")
+                combo.grid(row=i, column=1, sticky="ew", pady=4)
+                if not var.get() and option_fields[key]:
+                    var.set(option_fields[key][0])
+            else:
+                entry = ttk.Entry(body, textvariable=var, width=36)
+                entry.grid(row=i, column=1, sticky="ew", pady=4)
+
+        body.columnconfigure(1, weight=1)
+
+        buttons = ttk.Frame(self, padding=(12, 0, 12, 12))
+        buttons.grid(row=1, column=0, sticky="ew")
+        ttk.Button(buttons, text="取消", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(buttons, text="保存", command=self._submit).pack(side="right")
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.bind("<Return>", lambda _e: self._submit())
+
+        self.grab_set()
+        self.wait_visibility()
+        self.focus_set()
+
+    def _submit(self) -> None:
+        data = {k: v.get() for k, v in self._vars.items()}
+        if self._on_submit is not None:
+            self._on_submit(data)
+        self.destroy()
+
+
+class TractorManagementFrame(ttk.Frame):
+    """牵引车综合管理界面（车辆+轮胎+保养）"""
+    
+    def __init__(self, parent: tk.Widget, db: Database) -> None:
+        super().__init__(parent, padding=10)
+        self.db = db
+        self.selected_id: int | None = None
+
+        # 顶部标题
+        ttk.Label(self, text="牵引车综合管理", font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(0, 10))
+
+        # 水平分割：左侧车辆列表，右侧轮胎+保养
+        main_paned = ttk.Panedwindow(self, orient="horizontal")
+        main_paned.pack(fill="both", expand=True)
+
+        # 左侧：车辆列表
+        left_frame = ttk.Frame(main_paned, padding=(0, 0, 5, 0))
+        main_paned.add(left_frame, weight=1)
+
+        vehicle_header = ttk.Frame(left_frame)
+        vehicle_header.pack(fill="x")
+        ttk.Label(vehicle_header, text="车辆列表", font=("Segoe UI", 11, "bold")).pack(side="left")
+        ttk.Button(vehicle_header, text="新增", command=self.add_vehicle, width=6).pack(side="right", padx=(3, 0))
+        ttk.Button(vehicle_header, text="编辑", command=self.edit_vehicle, width=6).pack(side="right", padx=(3, 0))
+        ttk.Button(vehicle_header, text="删除", command=self.delete_vehicle, width=6).pack(side="right")
+
+        self.vehicle_tree = ttk.Treeview(left_frame, columns=("plate", "mileage"), show="headings", height=20)
+        self.vehicle_tree.heading("plate", text="车牌号")
+        self.vehicle_tree.heading("mileage", text="里程数")
+        self.vehicle_tree.column("plate", width=120, anchor="w")
+        self.vehicle_tree.column("mileage", width=80, anchor="e")
+        self.vehicle_tree.pack(fill="both", expand=True, pady=(8, 0))
+        self.vehicle_tree.bind("<<TreeviewSelect>>", self._handle_vehicle_select)
+
+        # 右侧：轮胎+保养的标签页
+        right_frame = ttk.Frame(main_paned, padding=(5, 0, 0, 0))
+        main_paned.add(right_frame, weight=2)
+
+        self.detail_notebook = ttk.Notebook(right_frame)
+        self.detail_notebook.pack(fill="both", expand=True)
+
+        # 轮胎标签页
+        tire_tab = ttk.Frame(self.detail_notebook, padding=10)
+        self.detail_notebook.add(tire_tab, text="轮胎管理（4轮）")
+        
+        tire_header = ttk.Frame(tire_tab)
+        tire_header.pack(fill="x")
+        ttk.Label(tire_header, text="轮胎更换记录", font=("Segoe UI", 11, "bold")).pack(side="left")
+        ttk.Button(tire_header, text="新增", command=self.add_tire_event, width=6).pack(side="right", padx=(3, 0))
+        ttk.Button(tire_header, text="编辑", command=self.edit_tire_event, width=6).pack(side="right", padx=(3, 0))
+        ttk.Button(tire_header, text="删除", command=self.delete_tire_event, width=6).pack(side="right")
+
+        tire_info_frame = ttk.Frame(tire_tab)
+        tire_info_frame.pack(fill="x", pady=(8, 5))
+        self.tire_vehicle_var = tk.StringVar(value="未选择牵引车")
+        ttk.Label(tire_info_frame, textvariable=self.tire_vehicle_var).pack(side="left")
+        self.tire_position_var = tk.StringVar(value="")
+        ttk.Label(tire_info_frame, textvariable=self.tire_position_var).pack(side="right")
+
+        tire_split = ttk.Panedwindow(tire_tab, orient="horizontal")
+        tire_split.pack(fill="both", expand=True, pady=(5, 0))
+
+        # 轮胎可视化
+        vis_frame = ttk.Frame(tire_split)
+        tire_split.add(vis_frame, weight=0)
+        ttk.Label(vis_frame, text="点击选择位置").pack(anchor="w")
+        self.tire_visualizer = TireVisualizer(
+            vis_frame,
+            tire_positions=TRACTOR_TIRE_POSITIONS,
+            vehicle_label="牵引车",
+            on_select=self._handle_tire_position_select,
+        )
+        self.tire_visualizer.pack(pady=(5, 0))
+
+        # 轮胎历史记录
+        history_frame = ttk.Frame(tire_split)
+        tire_split.add(history_frame, weight=1)
+        ttk.Label(history_frame, text="更换历史").pack(anchor="w")
+        self.tire_history_tree = ttk.Treeview(
+            history_frame,
+            columns=("date", "mileage", "brand", "model", "note"),
+            show="headings",
+            height=12
+        )
+        for col, text, width in [
+            ("date", "日期", 90),
+            ("mileage", "里程", 70),
+            ("brand", "品牌", 80),
+            ("model", "型号", 80),
+            ("note", "备注", 150),
+        ]:
+            self.tire_history_tree.heading(col, text=text)
+            self.tire_history_tree.column(col, width=width)
+        self.tire_history_tree.pack(fill="both", expand=True, pady=(5, 0))
+        self.tire_history_tree.bind("<<TreeviewSelect>>", self._handle_tire_history_select)
+
+        # 保养标签页
+        maint_tab = ttk.Frame(self.detail_notebook, padding=10)
+        self.detail_notebook.add(maint_tab, text="保养记录")
+
+        maint_header = ttk.Frame(maint_tab)
+        maint_header.pack(fill="x")
+        ttk.Label(maint_header, text="保养维护记录", font=("Segoe UI", 11, "bold")).pack(side="left")
+        ttk.Button(maint_header, text="新增", command=self.add_maintenance, width=6).pack(side="right", padx=(3, 0))
+        ttk.Button(maint_header, text="编辑", command=self.edit_maintenance, width=6).pack(side="right", padx=(3, 0))
+        ttk.Button(maint_header, text="删除", command=self.delete_maintenance, width=6).pack(side="right")
+
+        self.maint_vehicle_var = tk.StringVar(value="未选择牵引车")
+        ttk.Label(maint_tab, textvariable=self.maint_vehicle_var).pack(anchor="w", pady=(8, 5))
+
+        self.maint_tree = ttk.Treeview(
+            maint_tab,
+            columns=("date", "type", "mileage", "note"),
+            show="headings",
+            height=15
+        )
+        for col, text, width in [
+            ("date", "日期", 100),
+            ("type", "类型", 100),
+            ("mileage", "里程", 80),
+            ("note", "备注", 300),
+        ]:
+            self.maint_tree.heading(col, text=text)
+            self.maint_tree.column(col, width=width)
+        self.maint_tree.pack(fill="both", expand=True, pady=(5, 0))
+        self.maint_tree.bind("<<TreeviewSelect>>", self._handle_maint_select)
+
+        # 初始化状态
+        self.selected_tire_position: str | None = None
+        self.selected_tire_event_id: int | None = None
+        self.selected_maint_id: int | None = None
+
+        self.refresh_vehicles()
+
+    def refresh(self) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for v in self.db.list_tractors():
+            self.tree.insert("", "end", iid=str(v.id), values=(v.plate, v.mileage, v.note))
+
+        self.selected_id = None
+        self.detail_var.set("未选择牵引车")
+        self.on_select(None)
+
+    def _handle_select(self, _event: object) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            self.selected_id = None
+            self.detail_var.set("未选择牵引车")
+            self.on_select(None)
+            return
+        vehicle_id = int(sel[0])
+        v = self.db.get_tractor(vehicle_id)
+        self.selected_id = vehicle_id
+        if v:
+            self.detail_var.set(f"当前牵引车：{v.plate} | 里程：{v.mileage}")
+        else:
+            self.detail_var.set("未选择牵引车")
+        self.on_select(vehicle_id)
+
+    def add_item(self) -> None:
+        def submit(data: dict[str, str]) -> None:
+            try:
+                plate = data["plate"].strip()
+                mileage = _parse_int(data["mileage"], "里程数")
+                note = data.get("note", "")
+                self.db.create_tractor(plate=plate, mileage=mileage, note=note)
+                self.refresh()
+            except Exception as e:
+                messagebox.showerror("新增失败", str(e), parent=self)
+
+        EntryDialog(
+            self,
+            title="新增牵引车",
+            fields=[("plate", "车牌号"), ("mileage", "里程数"), ("note", "备注")],
+            initial={"mileage": "0"},
+            on_submit=submit,
+        )
+
+    def edit_item(self) -> None:
+        if self.selected_id is None:
+            messagebox.showinfo("提示", "请先选择牵引车", parent=self)
+            return
+        v = self.db.get_tractor(self.selected_id)
+        if not v:
+            self.refresh()
+            return
+
+        def submit(data: dict[str, str]) -> None:
+            try:
+                plate = data["plate"].strip()
+                mileage = _parse_int(data["mileage"], "里程数")
+                note = data.get("note", "")
+                self.db.update_tractor(tractor_id=v.id, plate=plate, mileage=mileage, note=note)
+                self.refresh()
+            except Exception as e:
+                messagebox.showerror("编辑失败", str(e), parent=self)
+
+        EntryDialog(
+            self,
+            title="编辑牵引车",
+            fields=[("plate", "车牌号"), ("mileage", "里程数"), ("note", "备注")],
+            initial={"plate": v.plate, "mileage": str(v.mileage), "note": v.note},
+            on_submit=submit,
+        )
+
+    def delete_item(self) -> None:
+        if self.selected_id is None:
+            messagebox.showinfo("提示", "请先选择牵引车", parent=self)
+            return
+        v = self.db.get_tractor(self.selected_id)
+        if not v:
+            self.refresh()
+            return
+        ok = messagebox.askyesno("确认删除", f"删除牵引车 {v.plate}？相关轮胎/保养记录将一并删除。", parent=self)
+        if not ok:
+            return
+        try:
+            self.db.delete_tractor(v.id)
+            self.refresh()
+        except Exception as e:
+            messagebox.showerror("删除失败", str(e), parent=self)
+
+
+class TrailerFrame(ttk.Frame):
+    """挂车管理界面"""
+    
+    def __init__(self, parent: tk.Widget, db: Database, on_select: Callable[[int | None], None]) -> None:
+        super().__init__(parent, padding=10)
+        self.db = db
+        self.on_select = on_select
+        self.selected_id: int | None = None
+
+        header = ttk.Frame(self)
+        header.pack(fill="x")
+        ttk.Label(header, text="挂车管理", font=("Segoe UI", 12, "bold")).pack(side="left")
+        ttk.Button(header, text="新增", command=self.add_item).pack(side="right", padx=(6, 0))
+        ttk.Button(header, text="编辑", command=self.edit_item).pack(side="right", padx=(6, 0))
+        ttk.Button(header, text="删除", command=self.delete_item).pack(side="right")
+
+        self.tree = ttk.Treeview(self, columns=("plate", "note"), show="headings", height=12)
+        self.tree.heading("plate", text="车牌号")
+        self.tree.heading("note", text="备注")
+        self.tree.column("plate", width=150, anchor="w")
+        self.tree.column("note", width=400, anchor="w")
+        self.tree.pack(fill="both", expand=True, pady=(10, 0))
+
+        self.tree.bind("<<TreeviewSelect>>", self._handle_select)
+
+        footer = ttk.Frame(self)
+        footer.pack(fill="x", pady=(10, 0))
+        self.detail_var = tk.StringVar(value="未选择挂车")
+        ttk.Label(footer, textvariable=self.detail_var).pack(side="left")
+
+        self.refresh()
+
+    def refresh(self) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for v in self.db.list_trailers():
+            self.tree.insert("", "end", iid=str(v.id), values=(v.plate, v.note))
+
+        self.selected_id = None
+        self.detail_var.set("未选择挂车")
+        self.on_select(None)
+
+    def _handle_select(self, _event: object) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            self.selected_id = None
+            self.detail_var.set("未选择挂车")
+            self.on_select(None)
+            return
+        vehicle_id = int(sel[0])
+        v = self.db.get_trailer(vehicle_id)
+        self.selected_id = vehicle_id
+        if v:
+            self.detail_var.set(f"当前挂车：{v.plate}")
+        else:
+            self.detail_var.set("未选择挂车")
+        self.on_select(vehicle_id)
+
+    def add_item(self) -> None:
+        def submit(data: dict[str, str]) -> None:
+            try:
+                plate = data["plate"].strip()
+                note = data.get("note", "")
+                self.db.create_trailer(plate=plate, note=note)
+                self.refresh()
+            except Exception as e:
+                messagebox.showerror("新增失败", str(e), parent=self)
+
+        EntryDialog(
+            self,
+            title="新增挂车",
+            fields=[("plate", "车牌号"), ("note", "备注")],
+            on_submit=submit,
+        )
+
+    def edit_item(self) -> None:
+        if self.selected_id is None:
+            messagebox.showinfo("提示", "请先选择挂车", parent=self)
+            return
+        v = self.db.get_trailer(self.selected_id)
+        if not v:
+            self.refresh()
+            return
+
+        def submit(data: dict[str, str]) -> None:
+            try:
+                plate = data["plate"].strip()
+                note = data.get("note", "")
+                self.db.update_trailer(trailer_id=v.id, plate=plate, note=note)
+                self.refresh()
+            except Exception as e:
+                messagebox.showerror("编辑失败", str(e), parent=self)
+
+        EntryDialog(
+            self,
+            title="编辑挂车",
+            fields=[("plate", "车牌号"), ("note", "备注")],
+            initial={"plate": v.plate, "note": v.note},
+            on_submit=submit,
+        )
+
+    def delete_item(self) -> None:
+        if self.selected_id is None:
+            messagebox.showinfo("提示", "请先选择挂车", parent=self)
+            return
+        v = self.db.get_trailer(self.selected_id)
+        if not v:
+            self.refresh()
+            return
+        ok = messagebox.askyesno("确认删除", f"删除挂车 {v.plate}？相关轮胎/保养记录将一并删除。", parent=self)
+        if not ok:
+            return
+        try:
+            self.db.delete_trailer(v.id)
+            self.refresh()
+        except Exception as e:
+            messagebox.showerror("删除失败", str(e), parent=self)
+
+
+class TireFrame(ttk.Frame):
+    """轮胎管理界面（支持牵引车和挂车）"""
+    
+    def __init__(self, parent: tk.Widget, db: Database, vehicle_type: str) -> None:
+        super().__init__(parent, padding=10)
+        self.db = db
+        self.vehicle_type = vehicle_type
+        self.vehicle_id: int | None = None
+        self.selected_position: str | None = None
+        self.selected_event_id: int | None = None
+
+        if vehicle_type == VEHICLE_TYPE_TRACTOR:
+            self.tire_positions = TRACTOR_TIRE_POSITIONS
+            title = "牵引车轮胎更换记录（4轮）"
+            vehicle_label = "牵引车"
+        else:
+            self.tire_positions = TRAILER_TIRE_POSITIONS
+            title = "挂车轮胎更换记录（6轮）"
+            vehicle_label = "挂车"
+
+        header = ttk.Frame(self)
+        header.pack(fill="x")
+        ttk.Label(header, text=title, font=("Segoe UI", 12, "bold")).pack(side="left")
+        ttk.Button(header, text="新增记录", command=self.add_event).pack(side="right", padx=(6, 0))
+        ttk.Button(header, text="编辑记录", command=self.edit_event).pack(side="right", padx=(6, 0))
+        ttk.Button(header, text="删除记录", command=self.delete_event).pack(side="right")
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", pady=(10, 0))
+        self.vehicle_label_var = tk.StringVar(value=f"未选择{vehicle_label}（请在对应页面选择）")
+        ttk.Label(top, textvariable=self.vehicle_label_var).pack(side="left")
+        self.tire_label_var = tk.StringVar(value="未选择轮胎")
+        ttk.Label(top, textvariable=self.tire_label_var).pack(side="right")
+
+        split = ttk.Panedwindow(self, orient="horizontal")
+        split.pack(fill="both", expand=True, pady=(10, 0))
+
+        left = ttk.Frame(split, padding=(0, 0, 10, 0))
+        right = ttk.Frame(split)
+        split.add(left, weight=0)
+        split.add(right, weight=1)
+
+        ttk.Label(left, text="轮胎位置（点击选择）").pack(anchor="w")
+        self.visualizer = TireVisualizer(
+            left,
+            tire_positions=self.tire_positions,
+            vehicle_label=vehicle_label,
+            on_select=self._handle_position_select,
+        )
+        self.visualizer.pack(fill="both", expand=True, pady=(6, 0))
+
+        ttk.Label(right, text="该轮胎的更换历史记录").pack(anchor="w")
+        self.history_tree = ttk.Treeview(
+            right, columns=("change_date", "mileage", "brand", "model", "note"), show="headings", height=14
+        )
+        for col, text, width, anchor in [
+            ("change_date", "更换日期", 100, "center"),
+            ("mileage", "里程", 80, "e"),
+            ("brand", "品牌", 100, "w"),
+            ("model", "型号", 100, "w"),
+            ("note", "备注", 250, "w"),
+        ]:
+            self.history_tree.heading(col, text=text)
+            self.history_tree.column(col, width=width, anchor=anchor)
+        self.history_tree.pack(fill="both", expand=True, pady=(6, 0))
+        self.history_tree.bind("<<TreeviewSelect>>", self._handle_history_select)
+
+        self.refresh()
+
+    def set_vehicle(self, vehicle_id: int | None, vehicle_plate: str | None) -> None:
+        self.vehicle_id = vehicle_id
+        self.selected_position = self.tire_positions[0] if vehicle_id is not None else None
+        self.selected_event_id = None
+        
+        label = "牵引车" if self.vehicle_type == VEHICLE_TYPE_TRACTOR else "挂车"
+        if vehicle_id is None:
+            self.vehicle_label_var.set(f"未选择{label}（请在对应页面选择）")
+        else:
+            self.vehicle_label_var.set(f"当前{label}：{vehicle_plate or vehicle_id}")
+        self.refresh()
+
+    def _handle_position_select(self, position: str) -> None:
+        if position in self.tire_positions:
+            self.selected_position = position
+            self.selected_event_id = None
+            self.visualizer.select(position)
+            self.refresh_history()
+
+    def _handle_history_select(self, _event: object) -> None:
+        sel = self.history_tree.selection()
+        self.selected_event_id = int(sel[0]) if sel else None
+
+    def refresh(self) -> None:
+        for item in self.history_tree.get_children():
+            self.history_tree.delete(item)
+
+        if self.vehicle_id is None:
+            self.tire_label_var.set("未选择轮胎")
+            self.visualizer.select(None)
+            return
+
+        if self.selected_position is None:
+            self.selected_position = self.tire_positions[0]
+
+        self.visualizer.select(self.selected_position)
+        self.refresh_history()
+
+    def refresh_history(self) -> None:
+        for item in self.history_tree.get_children():
+            self.history_tree.delete(item)
+        if self.vehicle_id is None or self.selected_position is None:
+            self.tire_label_var.set("未选择轮胎")
+            return
+        events = self.db.list_tire_events(self.vehicle_type, self.vehicle_id, position=self.selected_position)
+        self.tire_label_var.set(f"当前轮胎：{self.selected_position}（{len(events)}条记录）")
+        for e in events:
+            self.history_tree.insert(
+                "", "end", iid=str(e.id),
+                values=(e.change_date, e.mileage, e.brand, e.model, e.note),
+            )
+
+    def _ensure_vehicle(self) -> bool:
+        if self.vehicle_id is None:
+            label = "牵引车" if self.vehicle_type == VEHICLE_TYPE_TRACTOR else "挂车"
+            messagebox.showinfo("提示", f"请先在对应页面选择{label}", parent=self)
+            return False
+        return True
+
+    def add_event(self) -> None:
+        if not self._ensure_vehicle():
+            return
+        if self.selected_position is None:
+            messagebox.showinfo("提示", "请先选择轮胎位置", parent=self)
+            return
+
+        def submit(data: dict[str, str]) -> None:
+            try:
+                position = data["position"]
+                change_date = _parse_date(data["change_date"], "更换日期")
+                mileage = _parse_int(data["mileage"], "里程数")
+                brand = data.get("brand", "")
+                model = data.get("model", "")
+                note = data.get("note", "")
+                self.db.create_tire_event(
+                    vehicle_type=self.vehicle_type,
+                    vehicle_id=self.vehicle_id or 0,
+                    position=position,
+                    change_date=change_date,
+                    mileage=mileage,
+                    brand=brand,
+                    model=model,
+                    note=note,
+                )
+                self.refresh()
+            except Exception as e:
+                messagebox.showerror("新增失败", str(e), parent=self)
+
+        EntryDialog(
+            self,
+            title="新增轮胎更换记录",
+            fields=[
+                ("position", "位置"),
+                ("change_date", "更换日期(YYYY-MM-DD)"),
+                ("mileage", "里程数"),
+                ("brand", "品牌"),
+                ("model", "型号"),
+                ("note", "备注"),
+            ],
+            initial={"position": self.selected_position, "change_date": date.today().isoformat()},
+            option_fields={"position": self.tire_positions},
+            on_submit=submit,
+        )
+
+    def edit_event(self) -> None:
+        if not self._ensure_vehicle():
+            return
+        if self.selected_position is None:
+            messagebox.showinfo("提示", "请先选择轮胎位置", parent=self)
+            return
+        if self.selected_event_id is None:
+            messagebox.showinfo("提示", "请先选择一条记录", parent=self)
+            return
+
+        events = self.db.list_tire_events(self.vehicle_type, self.vehicle_id or 0, position=self.selected_position)
+        e = next((x for x in events if x.id == self.selected_event_id), None)
+        if e is None:
+            self.refresh_history()
+            return
+
+        def submit(data: dict[str, str]) -> None:
+            try:
+                position = data["position"]
+                change_date = _parse_date(data["change_date"], "更换日期")
+                mileage = _parse_int(data["mileage"], "里程数")
+                brand = data.get("brand", "")
+                model = data.get("model", "")
+                note = data.get("note", "")
+                self.db.update_tire_event(
+                    event_id=e.id,
+                    position=position,
+                    change_date=change_date,
+                    mileage=mileage,
+                    brand=brand,
+                    model=model,
+                    note=note,
+                )
+                self.refresh()
+            except Exception as ex:
+                messagebox.showerror("编辑失败", str(ex), parent=self)
+
+        EntryDialog(
+            self,
+            title="编辑轮胎更换记录",
+            fields=[
+                ("position", "位置"),
+                ("change_date", "更换日期(YYYY-MM-DD)"),
+                ("mileage", "里程数"),
+                ("brand", "品牌"),
+                ("model", "型号"),
+                ("note", "备注"),
+            ],
+            initial={
+                "position": e.position,
+                "change_date": e.change_date,
+                "mileage": str(e.mileage),
+                "brand": e.brand,
+                "model": e.model,
+                "note": e.note,
+            },
+            option_fields={"position": self.tire_positions},
+            on_submit=submit,
+        )
+
+    def delete_event(self) -> None:
+        if not self._ensure_vehicle():
+            return
+        if self.selected_position is None:
+            messagebox.showinfo("提示", "请先选择轮胎位置", parent=self)
+            return
+        if self.selected_event_id is None:
+            messagebox.showinfo("提示", "请先选择一条记录", parent=self)
+            return
+        ok = messagebox.askyesno("确认删除", "删除该轮胎更换记录？", parent=self)
+        if not ok:
+            return
+        try:
+            self.db.delete_tire_event(self.selected_event_id)
+            self.selected_event_id = None
+            self.refresh()
+        except Exception as e:
+            messagebox.showerror("删除失败", str(e), parent=self)
+
+
+class MaintenanceFrame(ttk.Frame):
+    """保养记录管理界面"""
+    
+    def __init__(self, parent: tk.Widget, db: Database, vehicle_type: str) -> None:
+        super().__init__(parent, padding=10)
+        self.db = db
+        self.vehicle_type = vehicle_type
+        self.vehicle_id: int | None = None
+        self.selected_record_id: int | None = None
+
+        if vehicle_type == VEHICLE_TYPE_TRACTOR:
+            title = "牵引车保养记录"
+            self.vehicle_label = "牵引车"
+        else:
+            title = "挂车保养记录"
+            self.vehicle_label = "挂车"
+
+        header = ttk.Frame(self)
+        header.pack(fill="x")
+        ttk.Label(header, text=title, font=("Segoe UI", 12, "bold")).pack(side="left")
+        ttk.Button(header, text="新增记录", command=self.add_record).pack(side="right", padx=(6, 0))
+        ttk.Button(header, text="编辑记录", command=self.edit_record).pack(side="right", padx=(6, 0))
+        ttk.Button(header, text="删除记录", command=self.delete_record).pack(side="right")
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", pady=(10, 0))
+        self.vehicle_label_var = tk.StringVar(value=f"未选择{self.vehicle_label}（请在对应页面选择）")
+        ttk.Label(top, textvariable=self.vehicle_label_var).pack(side="left")
+
+        self.tree = ttk.Treeview(self, columns=("service_date", "record_type", "mileage", "note"), show="headings", height=14)
+        for col, text, width, anchor in [
+            ("service_date", "日期", 100, "center"),
+            ("record_type", "类型", 100, "w"),
+            ("mileage", "里程", 80, "e"),
+            ("note", "备注", 350, "w"),
+        ]:
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=width, anchor=anchor)
+        self.tree.pack(fill="both", expand=True, pady=(10, 0))
+        self.tree.bind("<<TreeviewSelect>>", self._handle_select)
+
+        self.refresh()
+
+    def set_vehicle(self, vehicle_id: int | None, vehicle_plate: str | None) -> None:
+        self.vehicle_id = vehicle_id
+        self.selected_record_id = None
+        if vehicle_id is None:
+            self.vehicle_label_var.set(f"未选择{self.vehicle_label}（请在对应页面选择）")
+        else:
+            self.vehicle_label_var.set(f"当前{self.vehicle_label}：{vehicle_plate or vehicle_id}")
+        self.refresh()
+
+    def _ensure_vehicle(self) -> bool:
+        if self.vehicle_id is None:
+            messagebox.showinfo("提示", f"请先在对应页面选择{self.vehicle_label}", parent=self)
+            return False
+        return True
+
+    def _handle_select(self, _event: object) -> None:
+        sel = self.tree.selection()
+        self.selected_record_id = int(sel[0]) if sel else None
+
+    def refresh(self) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        if self.vehicle_id is None:
+            return
+        for r in self.db.list_maintenance_records(self.vehicle_type, self.vehicle_id):
+            self.tree.insert("", "end", iid=str(r.id), values=(r.service_date, r.record_type, r.mileage, r.note))
+
+    def add_record(self) -> None:
+        if not self._ensure_vehicle():
+            return
+
+        def submit(data: dict[str, str]) -> None:
+            try:
+                record_type = data["record_type"]
+                service_date = _parse_date(data["service_date"], "日期")
+                mileage = _parse_int(data["mileage"], "里程数")
+                note = data.get("note", "")
+                self.db.create_maintenance_record(
+                    vehicle_type=self.vehicle_type,
+                    vehicle_id=self.vehicle_id or 0,
+                    record_type=record_type,
+                    service_date=service_date,
+                    mileage=mileage,
+                    note=note,
+                )
+                self.refresh()
+            except Exception as e:
+                messagebox.showerror("新增失败", str(e), parent=self)
+
+        EntryDialog(
+            self,
+            title="新增保养记录",
+            fields=[("record_type", "类型"), ("service_date", "日期(YYYY-MM-DD)"), ("mileage", "里程数"), ("note", "备注")],
+            initial={"service_date": date.today().isoformat()},
+            option_fields={"record_type": MAINTENANCE_TYPES},
+            on_submit=submit,
+        )
+
+    def edit_record(self) -> None:
+        if not self._ensure_vehicle():
+            return
+        if self.selected_record_id is None:
+            messagebox.showinfo("提示", "请先选择一条记录", parent=self)
+            return
+
+        records = {r.id: r for r in self.db.list_maintenance_records(self.vehicle_type, self.vehicle_id or 0)}
+        r = records.get(self.selected_record_id)
+        if r is None:
+            self.refresh()
+            return
+
+        def submit(data: dict[str, str]) -> None:
+            try:
+                record_type = data["record_type"]
+                service_date = _parse_date(data["service_date"], "日期")
+                mileage = _parse_int(data["mileage"], "里程数")
+                note = data.get("note", "")
+                self.db.update_maintenance_record(
+                    record_id=r.id,
+                    record_type=record_type,
+                    service_date=service_date,
+                    mileage=mileage,
+                    note=note,
+                )
+                self.refresh()
+            except Exception as e:
+                messagebox.showerror("编辑失败", str(e), parent=self)
+
+        EntryDialog(
+            self,
+            title="编辑保养记录",
+            fields=[("record_type", "类型"), ("service_date", "日期(YYYY-MM-DD)"), ("mileage", "里程数"), ("note", "备注")],
+            initial={"record_type": r.record_type, "service_date": r.service_date, "mileage": str(r.mileage), "note": r.note},
+            option_fields={"record_type": MAINTENANCE_TYPES},
+            on_submit=submit,
+        )
+
+    def delete_record(self) -> None:
+        if not self._ensure_vehicle():
+            return
+        if self.selected_record_id is None:
+            messagebox.showinfo("提示", "请先选择一条记录", parent=self)
+            return
+        ok = messagebox.askyesno("确认删除", "删除该保养记录？", parent=self)
+        if not ok:
+            return
+        try:
+            self.db.delete_maintenance_record(self.selected_record_id)
+            self.selected_record_id = None
+            self.refresh()
+        except Exception as e:
+            messagebox.showerror("删除失败", str(e), parent=self)
+
+
+class ExportFrame(ttk.Frame):
+    """数据导出界面"""
+    
+    def __init__(self, parent: tk.Widget, db: Database) -> None:
+        super().__init__(parent, padding=10)
+        self.db = db
+        ttk.Label(self, text="数据导出", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(self, text="导出为CSV（可用Excel直接打开）").pack(anchor="w", pady=(6, 0))
+        ttk.Label(self, text="将导出：牵引车、挂车、轮胎记录、保养记录").pack(anchor="w", pady=(3, 0))
+        ttk.Button(self, text="选择目录并导出", command=self._export).pack(anchor="w", pady=(12, 0))
+        self.result_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.result_var).pack(anchor="w", pady=(12, 0))
+
+    def _export(self) -> None:
+        folder = filedialog.askdirectory(title="选择导出目录")
+        if not folder:
+            return
+        try:
+            paths = export_csv(self.db, Path(folder))
+            self.result_var.set("已导出： " + " | ".join([p.name for p in paths]))
+            messagebox.showinfo("导出成功", "已导出CSV文件。", parent=self)
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e), parent=self)
+
+
+class TruckCareApp(tk.Tk):
+    """主应用窗口"""
+    
+    def __init__(self, db: Database) -> None:
+        super().__init__()
+        self.db = db
+        self.title("Truck Care - 牵引车/挂车健康管理")
+        self.geometry("950x650")
+
+        root = ttk.Frame(self, padding=10)
+        root.pack(fill="both", expand=True)
+
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True)
+
+        # 创建所有页面（先不设置回调，避免初始化顺序问题）
+        self.tractor_frame = TractorFrame(self.notebook, db, on_select=lambda _: None)
+        self.tractor_tire_frame = TireFrame(self.notebook, db, VEHICLE_TYPE_TRACTOR)
+        self.tractor_maintenance_frame = MaintenanceFrame(self.notebook, db, VEHICLE_TYPE_TRACTOR)
+
+        self.trailer_frame = TrailerFrame(self.notebook, db, on_select=lambda _: None)
+        self.trailer_tire_frame = TireFrame(self.notebook, db, VEHICLE_TYPE_TRAILER)
+        self.trailer_maintenance_frame = MaintenanceFrame(self.notebook, db, VEHICLE_TYPE_TRAILER)
+
+        self.export_frame = ExportFrame(self.notebook, db)
+
+        # 现在所有 frame 都创建好了，设置真正的回调
+        self.tractor_frame.on_select = self._on_tractor_selected
+        self.trailer_frame.on_select = self._on_trailer_selected
+
+        # 添加标签页
+        self.notebook.add(self.tractor_frame, text="牵引车")
+        self.notebook.add(self.tractor_tire_frame, text="牵引车轮胎")
+        self.notebook.add(self.tractor_maintenance_frame, text="牵引车保养")
+        self.notebook.add(self.trailer_frame, text="挂车")
+        self.notebook.add(self.trailer_tire_frame, text="挂车轮胎")
+        self.notebook.add(self.trailer_maintenance_frame, text="挂车保养")
+        self.notebook.add(self.export_frame, text="导出")
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_tractor_selected(self, tractor_id: int | None) -> None:
+        plate = None
+        if tractor_id is not None:
+            v = self.db.get_tractor(tractor_id)
+            plate = v.plate if v else None
+        self.tractor_tire_frame.set_vehicle(tractor_id, plate)
+        self.tractor_maintenance_frame.set_vehicle(tractor_id, plate)
+
+    def _on_trailer_selected(self, trailer_id: int | None) -> None:
+        plate = None
+        if trailer_id is not None:
+            v = self.db.get_trailer(trailer_id)
+            plate = v.plate if v else None
+        self.trailer_tire_frame.set_vehicle(trailer_id, plate)
+        self.trailer_maintenance_frame.set_vehicle(trailer_id, plate)
+
+    def _on_close(self) -> None:
+        try:
+            self.db.close()
+        finally:
+            self.destroy()
+
+
+def main() -> None:
+    db = Database()
+    db.init_db()
+    app = TruckCareApp(db)
+    app.mainloop()
