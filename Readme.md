@@ -32,3 +32,8 @@
 
 优先考虑开发速度和易用性，其次是性能。
 无需支持移动端或Web。
+
+打包命令
+```
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name TruckCare run.py
+```
